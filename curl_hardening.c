@@ -11,7 +11,7 @@
  * Polyfill of CURLOPT_OPENSOCKETFUNCTION as proposed for ext/curl in PHP 8.7:
  *
  *     curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION,
- *         function (CurlHandle $handle, int $purpose, CurlSocketAddress $address): ?CurlSocket { ... });
+ *         function (CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $port): bool { ... });
  *
  * ext/curl does not know about the option, so the extension intercepts the
  * ext/curl functions and handlers that need to (see "Interception of ext/curl")
@@ -29,6 +29,7 @@
 #include "ext/standard/info.h"
 #include "ext/standard/php_net.h"
 #include "ext/curl/php_curl.h"
+#include "php_network.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -41,7 +42,6 @@
 # include <sys/un.h>
 # include <netinet/in.h>
 # include <arpa/inet.h>
-# include <unistd.h>
 #endif
 
 #include <curl/curl.h>
@@ -59,9 +59,6 @@ ZEND_DECLARE_MODULE_GLOBALS(curl_hardening)
 static bool curl_hardening_enabled;
 
 static zend_class_entry *curl_address_family_ce;
-static zend_class_entry *curl_socket_address_ce;
-static zend_class_entry *curl_socket_ce;
-static zend_object_handlers curl_socket_object_handlers;
 
 /* {{{ Reaching libcurl through ext/curl
  *
@@ -100,6 +97,12 @@ static bool curl_hardening_probe(void)
 	 * install: assume failure until proven otherwise. */
 	CURL_HARDENING_G(probe_state) = -1;
 
+	/* Calling a function is a no-op while an exception is pending, which
+	 * curl_setopt_array() may reach us with: set it aside for the probe. We
+	 * run inside an internal function, so no opline needs saving with it. */
+	zend_object *pending = EG(exception);
+	EG(exception) = NULL;
+
 	zval fname, handle;
 	ZVAL_STRING(&fname, "curl_init");
 	ZVAL_UNDEF(&handle);
@@ -122,6 +125,14 @@ static bool curl_hardening_probe(void)
 	zval_ptr_dtor(&fname);
 	zval_ptr_dtor(&handle);
 
+	if (pending != NULL) {
+		if (EG(exception) != NULL) {
+			zend_exception_set_previous(EG(exception), pending);
+		} else {
+			EG(exception) = pending;
+		}
+	}
+
 	return CURL_HARDENING_G(probe_state) > 0;
 }
 /* }}} */
@@ -131,8 +142,9 @@ static bool curl_hardening_probe(void)
  * ext/curl gives us nowhere to store anything on a CurlHandle, so every handle
  * the extension deals with gets a curl_hardening_handle, kept in a
  * request-scoped table keyed by object address and freed together with the
- * object. It is what libcurl's CURLOPT_OPENSOCKETDATA points at, which is how
- * the callback knows which handle performs the transfer.
+ * object. Its id, unique for the life of the process, is what libcurl's
+ * CURLOPT_OPENSOCKETDATA holds, which is how the callback finds the handle
+ * performing the transfer.
  *
  * The callback itself lives in a curl_hardening_state, shared by a handle and
  * its copies and reference counted, one reference per handle. States are
@@ -152,8 +164,7 @@ typedef struct {
 typedef struct {
 	zend_object *object;          /* not a counted reference: freed with it */
 	curl_hardening_state *state;  /* one counted reference, or NULL */
-	bool interface_set;           /* CURLOPT_INTERFACE is set */
-	bool localport_set;           /* CURLOPT_LOCALPORT is set */
+	zend_ulong id;
 	bool in_callback;
 } curl_hardening_handle;
 
@@ -191,11 +202,26 @@ static void curl_hardening_state_release(curl_hardening_state *state)
 	}
 }
 
+/* Both lookups find nothing outside a request: the tables do not exist then. */
 static curl_hardening_handle *curl_hardening_handle_find(zend_object *obj)
 {
+	if (!CURL_HARDENING_G(active)) {
+		return NULL;
+	}
+
 	return zend_hash_index_find_ptr(&CURL_HARDENING_G(handles), CURL_HARDENING_KEY(obj));
 }
 
+static curl_hardening_handle *curl_hardening_handle_find_id(zend_ulong id)
+{
+	if (!CURL_HARDENING_G(active)) {
+		return NULL;
+	}
+
+	return zend_hash_index_find_ptr(&CURL_HARDENING_G(ids), id);
+}
+
+/* Only called while active. */
 static curl_hardening_handle *curl_hardening_handle_get(zend_object *obj)
 {
 	curl_hardening_handle *hh = curl_hardening_handle_find(obj);
@@ -203,23 +229,37 @@ static curl_hardening_handle *curl_hardening_handle_get(zend_object *obj)
 	if (hh == NULL) {
 		hh = ecalloc(1, sizeof(curl_hardening_handle));
 		hh->object = obj;
+		hh->id = ++CURL_HARDENING_G(last_id);
 		zend_hash_index_add_new_ptr(&CURL_HARDENING_G(handles), CURL_HARDENING_KEY(obj), hh);
+		zend_hash_index_add_new_ptr(&CURL_HARDENING_G(ids), hh->id, hh);
 	}
 
 	return hh;
 }
 
+static void curl_hardening_handle_free(curl_hardening_handle *hh)
+{
+	curl_hardening_state_release(hh->state);
+	efree(hh);
+}
+
 static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpose,
 		struct curl_sockaddr *address);
 
-/* libcurl's option is armed if and only if hh->state is set. */
+/* libcurl's option is armed if and only if hh->state is set.
+ *
+ * libcurl copies CURLOPT_OPENSOCKETDATA into easy handles we never see: those
+ * ext/curl creates for HTTP/2 server push duplicate their parent's options
+ * without going through curl_copy_handle() or clone. A pointer could then
+ * outlive the handle it designates. An id cannot: the trampoline looks it up,
+ * and refuses the connection once its handle is gone. */
 static void curl_hardening_arm(curl_hardening_handle *hh)
 {
 	CURL *cp = curl_hardening_easy_handle(hh->object);
 
 	if (cp != NULL) {
 		curl_easy_setopt(cp, CURLOPT_OPENSOCKETFUNCTION, curl_hardening_opensocket);
-		curl_easy_setopt(cp, CURLOPT_OPENSOCKETDATA, hh);
+		curl_easy_setopt(cp, CURLOPT_OPENSOCKETDATA, (void *) (uintptr_t) hh->id);
 	}
 }
 
@@ -234,152 +274,8 @@ static void curl_hardening_disarm(zend_object *obj)
 }
 /* }}} */
 
-/* {{{ CurlSocket: a description, never a descriptor */
-typedef struct {
-	bool has_bind;
-	int bind_family;
-	socklen_t bind_len;
-	struct sockaddr_storage bind_addr;
-	zend_object std;
-} curl_socket_object;
-
-static inline curl_socket_object *curl_socket_from_obj(zend_object *obj)
-{
-	return (curl_socket_object *) ((char *) obj - offsetof(curl_socket_object, std));
-}
-
-static zend_object *curl_socket_create_object(zend_class_entry *ce)
-{
-	curl_socket_object *intern = zend_object_alloc(sizeof(curl_socket_object), ce);
-
-	memset(intern, 0, offsetof(curl_socket_object, std));
-	zend_object_std_init(&intern->std, ce);
-	object_properties_init(&intern->std, ce);
-
-	return &intern->std;
-}
-
-static zend_object *curl_socket_clone_object(zend_object *old)
-{
-	zend_object *new_obj = curl_socket_create_object(old->ce);
-
-	zend_objects_clone_members(new_obj, old);
-	memcpy(curl_socket_from_obj(new_obj), curl_socket_from_obj(old), offsetof(curl_socket_object, std));
-
-	return new_obj;
-}
-
-PHP_METHOD(CurlSocket, bind)
-{
-	zend_string *address;
-	zend_long port = 0;
-
-	ZEND_PARSE_PARAMETERS_START(1, 2)
-		Z_PARAM_STR(address)
-		Z_PARAM_OPTIONAL
-		Z_PARAM_LONG(port)
-	ZEND_PARSE_PARAMETERS_END();
-
-	if (port < 0 || port > 65535) {
-		zend_argument_value_error(2, "must be between 0 and 65535");
-		RETURN_THROWS();
-	}
-
-	curl_socket_object *intern = curl_socket_from_obj(Z_OBJ_P(ZEND_THIS));
-	struct sockaddr_storage storage;
-	memset(&storage, 0, sizeof(storage));
-
-	/* inet_pton() stops at the first NUL: reject embedded ones explicitly. */
-	bool valid = memchr(ZSTR_VAL(address), '\0', ZSTR_LEN(address)) == NULL;
-	int family = AF_UNSPEC;
-	socklen_t len = 0;
-
-	if (valid) {
-		struct sockaddr_in *in4 = (struct sockaddr_in *) &storage;
-		struct sockaddr_in6 *in6 = (struct sockaddr_in6 *) &storage;
-
-		if (inet_pton(AF_INET, ZSTR_VAL(address), &in4->sin_addr) == 1) {
-			in4->sin_family = family = AF_INET;
-			in4->sin_port = htons((unsigned short) port);
-			len = sizeof(*in4);
-		} else if (inet_pton(AF_INET6, ZSTR_VAL(address), &in6->sin6_addr) == 1) {
-			in6->sin6_family = family = AF_INET6;
-			in6->sin6_port = htons((unsigned short) port);
-			len = sizeof(*in6);
-		} else {
-			valid = false;
-		}
-	}
-
-	if (!valid) {
-		zend_argument_value_error(1, "must be a valid IPv4 or IPv6 address");
-		RETURN_THROWS();
-	}
-
-	intern->has_bind = true;
-	intern->bind_family = family;
-	intern->bind_len = len;
-	memcpy(&intern->bind_addr, &storage, sizeof(storage));
-}
-
-/* Creates the socket for a connection the callback allowed, as described. */
-static curl_socket_t curl_hardening_create_socket(curl_hardening_handle *hh,
-		const curl_socket_object *desc, const struct curl_sockaddr *address)
-{
-	if (desc->has_bind) {
-		if (hh->interface_set || hh->localport_set) {
-			/* libcurl binds again after us for these options: the second bind()
-			 * would fail with an error far from its cause. */
-			zend_throw_error(NULL,
-				"CurlSocket::bind() cannot be used on a handle that sets CURLOPT_INTERFACE or CURLOPT_LOCALPORT");
-			return CURL_SOCKET_BAD;
-		}
-
-		if (desc->bind_family != address->family) {
-			/* Refuse this attempt only: on a dual stack host libcurl then tries
-			 * the next address family, which the bind may well match. */
-			return CURL_SOCKET_BAD;
-		}
-	}
-
-	curl_socket_t fd = socket(address->family, address->socktype, address->protocol);
-
-	if (fd != CURL_SOCKET_BAD && desc->has_bind
-			&& bind(fd, (const struct sockaddr *) &desc->bind_addr, desc->bind_len) != 0) {
-#ifdef PHP_WIN32
-		closesocket(fd);
-#else
-		close(fd);
-#endif
-		fd = CURL_SOCKET_BAD;
-	}
-
-	return fd;
-}
-/* }}} */
-
-/* {{{ CurlSocketAddress */
-PHP_METHOD(CurlSocketAddress, __construct)
-{
-	/* Only reachable through reflection: the constructor is private. */
-	zend_throw_error(NULL, "Cannot directly construct CurlSocketAddress");
-}
-
-static zend_long curl_hardening_sockaddr_port(const struct sockaddr *sa)
-{
-	switch (sa->sa_family) {
-		case AF_INET:
-			return ntohs(((const struct sockaddr_in *) sa)->sin_port);
-#ifdef AF_INET6
-		case AF_INET6:
-			return ntohs(((const struct sockaddr_in6 *) sa)->sin6_port);
-#endif
-		default:
-			return 0;
-	}
-}
-
-#ifdef AF_UNIX
+/* {{{ Describing the endpoint */
+#if defined(AF_UNIX) && !defined(PHP_WIN32)
 /* The path of a UNIX domain socket, as libcurl built it. A Linux abstract
  * socket name starts with a NUL byte, which is kept: it is part of the name. */
 static zend_string *curl_hardening_unix_path(const struct curl_sockaddr *address)
@@ -392,7 +288,7 @@ static zend_string *curl_hardening_unix_path(const struct curl_sockaddr *address
 		len = sizeof(sun->sun_path);
 	}
 	if (len > 0 && sun->sun_path[0] != '\0') {
-		/* A pathname: libcurl counts the terminating NUL in addrlen. */
+		/* A pathname: libcurl may count the terminating NUL in addrlen. */
 		len = zend_strnlen(sun->sun_path, len);
 	}
 
@@ -400,46 +296,48 @@ static zend_string *curl_hardening_unix_path(const struct curl_sockaddr *address
 }
 #endif
 
-/* Builds the CurlSocketAddress for the callback. Returns false for anything
- * that cannot be described, which is then refused without calling it. */
-static bool curl_hardening_socket_address(zval *zv, const struct curl_sockaddr *address)
+/* Fills the $family, $address and $port arguments. Returns false for anything
+ * that cannot be described, which is then refused without calling the callback. */
+static bool curl_hardening_describe(zval *args, const struct curl_sockaddr *address)
 {
 	const char *family;
-	zend_string *str;
-	zend_long port = 0;
 
 	switch (address->family) {
 		case AF_INET:
-		case AF_INET6:
-			family = address->family == AF_INET ? "IpV4" : "IpV6";
-			str = php_inet_ntop(&address->addr);
-			if (str == NULL) {
-				return false;
-			}
-			port = curl_hardening_sockaddr_port(&address->addr);
+			family = "IpV4";
+			ZVAL_LONG(&args[2], ntohs(((const struct sockaddr_in *) &address->addr)->sin_port));
 			break;
-#ifdef AF_UNIX
+#ifdef AF_INET6
+		case AF_INET6:
+			family = "IpV6";
+			ZVAL_LONG(&args[2], ntohs(((const struct sockaddr_in6 *) &address->addr)->sin6_port));
+			break;
+#endif
+#if defined(AF_UNIX) && !defined(PHP_WIN32)
 		case AF_UNIX:
+			/* A path has no port. */
 			family = "Unix";
-			str = curl_hardening_unix_path(address);
+			ZVAL_NULL(&args[2]);
 			break;
 #endif
 		default:
 			return false;
 	}
 
-	object_init_ex(zv, curl_socket_address_ce);
-	zend_object *obj = Z_OBJ_P(zv);
-
-	/* Readonly properties, in declaration order, written in place and marked
-	 * initialized. */
-	ZVAL_OBJ_COPY(OBJ_PROP_NUM(obj, 0), zend_enum_get_case_cstr(curl_address_family_ce, family));
-	ZVAL_STR(OBJ_PROP_NUM(obj, 1), str);
-	ZVAL_LONG(OBJ_PROP_NUM(obj, 2), port);
-	for (uint32_t i = 0; i < 3; i++) {
-		Z_PROP_FLAG_P(OBJ_PROP_NUM(obj, i)) &= ~(IS_PROP_UNINIT | IS_PROP_REINITABLE);
+#if defined(AF_UNIX) && !defined(PHP_WIN32)
+	if (address->family == AF_UNIX) {
+		ZVAL_STR(&args[1], curl_hardening_unix_path(address));
+	} else
+#endif
+	{
+		zend_string *ip = php_inet_ntop(&address->addr);
+		if (ip == NULL) {
+			return false;
+		}
+		ZVAL_STR(&args[1], ip);
 	}
 
+	ZVAL_OBJ_COPY(&args[0], zend_enum_get_case_cstr(curl_address_family_ce, family));
 	return true;
 }
 /* }}} */
@@ -448,20 +346,21 @@ static bool curl_hardening_socket_address(zval *zv, const struct curl_sockaddr *
 static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpose,
 		struct curl_sockaddr *address)
 {
-	curl_hardening_handle *hh = (curl_hardening_handle *) clientp;
-	curl_hardening_state *state = hh->state;
+	curl_hardening_handle *hh = curl_hardening_handle_find_id((zend_ulong) (uintptr_t) clientp);
+	curl_hardening_state *state = hh != NULL ? hh->state : NULL;
 
 	/* Whatever cannot be described to the callback is refused without calling
 	 * it: a policy must never be bypassed by an endpoint it was not shown.
 	 * CURLSOCKTYPE_IPCXN is the only purpose libcurl currently uses; a future
-	 * one may well not designate a destination at all. */
+	 * one may well not designate a destination at all. An unknown id is a
+	 * handle that is gone (see curl_hardening_arm()). */
 	if (UNEXPECTED(state == NULL || purpose != CURLSOCKTYPE_IPCXN)) {
 		return CURL_SOCKET_BAD;
 	}
 
-	zval args[3], retval;
+	zval args[4], retval;
 
-	if (!curl_hardening_socket_address(&args[2], address)) {
+	if (!curl_hardening_describe(&args[1], address)) {
 		return CURL_SOCKET_BAD;
 	}
 
@@ -471,33 +370,44 @@ static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpo
 	curl_hardening_state_acquire(state);
 	GC_ADDREF(hh->object);
 	ZVAL_OBJ(&args[0], hh->object);
-	ZVAL_LONG(&args[1], purpose);
 	ZVAL_UNDEF(&retval);
 
+	bool was_in_callback = hh->in_callback;
 	hh->in_callback = true;
-	zend_call_known_fcc(&state->fcc, &retval, /* param_count */ 3, args, /* named_params */ NULL);
-	hh->in_callback = false;
+	zend_call_known_fcc(&state->fcc, &retval, /* param_count */ 4, args, /* named_params */ NULL);
+	hh->in_callback = was_in_callback;
 
 	curl_socket_t fd = CURL_SOCKET_BAD;
 
 	/* retval is undefined when the callback threw: the connection is refused
 	 * and the exception propagates out of curl_exec(). */
 	if (!Z_ISUNDEF(retval)) {
-		if (Z_TYPE(retval) == IS_OBJECT && Z_OBJCE(retval) == curl_socket_ce) {
-			fd = curl_hardening_create_socket(hh, curl_socket_from_obj(Z_OBJ(retval)), address);
-		} else if (Z_TYPE(retval) != IS_NULL) {
-			zend_type_error("The CURLOPT_OPENSOCKETFUNCTION callback must return a CurlSocket or null");
+		if (Z_TYPE(retval) == IS_TRUE) {
+			/* What libcurl documents as the default behaviour of the hook. */
+			fd = socket(address->family, address->socktype, address->protocol);
+			/* Where socket() supports SOCK_NONBLOCK, libcurl only makes a socket
+			 * non-blocking if it came from this callback, which it checks after
+			 * the call: if the callback removed the option, the socket would
+			 * stay blocking and ignore the connect timeout. */
+			if (fd != CURL_SOCKET_BAD && php_set_sock_blocking(fd, false) != SUCCESS) {
+				closesocket(fd);
+				fd = CURL_SOCKET_BAD;
+			}
+		} else if (Z_TYPE(retval) != IS_FALSE) {
+			zend_type_error("The CURLOPT_OPENSOCKETFUNCTION callback must return a bool");
 		}
 		zval_ptr_dtor(&retval);
 	}
 
 	zval_ptr_dtor(&args[0]);
+	zval_ptr_dtor(&args[1]);
 	zval_ptr_dtor(&args[2]);
 	curl_hardening_state_release(state);
 
 	return fd;
 }
 /* }}} */
+
 
 /* {{{ Setting the option
  *
@@ -507,7 +417,9 @@ static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpo
  */
 static bool curl_hardening_set_callback(zend_object *obj, zval *value, bool is_array_config)
 {
-	if (!curl_hardening_probe()) {
+	ZVAL_DEREF(value);
+
+	if (!CURL_HARDENING_G(active) || !curl_hardening_probe()) {
 		zend_throw_error(NULL,
 			"CURLOPT_OPENSOCKETFUNCTION is unavailable: curl_hardening cannot reach libcurl "
 			"through this ext/curl build, and refuses to install a filter that would not be enforced");
@@ -552,21 +464,6 @@ static bool curl_hardening_set_callback(zend_object *obj, zval *value, bool is_a
 	return ok;
 }
 
-/* Tracks the options libcurl binds with after our callback returns. */
-static void curl_hardening_record_option(zend_object *obj, zend_long option, zval *value)
-{
-	if (option != CURLOPT_INTERFACE && option != CURLOPT_LOCALPORT) {
-		return;
-	}
-
-	curl_hardening_handle *hh = curl_hardening_handle_get(obj);
-
-	if (option == CURLOPT_INTERFACE) {
-		hh->interface_set = Z_TYPE_P(value) != IS_NULL;
-	} else {
-		hh->localport_set = zval_get_long(value) != 0;
-	}
-}
 /* }}} */
 
 /* {{{ Interception of ext/curl
@@ -575,11 +472,11 @@ static void curl_hardening_record_option(zend_object *obj, zend_long option, zva
  * provide the option. Each hook calls through to ext/curl for anything that is
  * not ours:
  *
- * - curl_setopt(), curl_setopt_array(): set CURLOPT_OPENSOCKETFUNCTION, and
- *   track CURLOPT_INTERFACE / CURLOPT_LOCALPORT;
+ * - curl_setopt(), curl_setopt_array(): set CURLOPT_OPENSOCKETFUNCTION;
  * - curl_reset(): drop the callback like any other option, and refuse to run
  *   from within it, as ext/curl does for its own callbacks -- libcurl's
  *   curl_easy_reset() performs no such check;
+ * - curl_close(): refuse to run from within the callback, as ext/curl does;
  * - CurlHandle's clone_obj handler: `clone $handle` on every version, and
  *   curl_copy_handle() from PHP 8.5 on, which routes through it;
  * - curl_copy_handle() itself: before PHP 8.5 it duplicates the handle directly
@@ -599,7 +496,6 @@ typedef struct {
 	const char *name;
 	size_t name_len;
 	zif_handler hook;
-	zend_function *function;
 	zif_handler original;
 } curl_hardening_function_hook;
 
@@ -607,27 +503,27 @@ static ZEND_NAMED_FUNCTION(curl_hardening_setopt);
 static ZEND_NAMED_FUNCTION(curl_hardening_setopt_array);
 static ZEND_NAMED_FUNCTION(curl_hardening_reset);
 static ZEND_NAMED_FUNCTION(curl_hardening_copy_handle);
+static ZEND_NAMED_FUNCTION(curl_hardening_close);
 
-enum { HOOK_SETOPT, HOOK_SETOPT_ARRAY, HOOK_RESET, HOOK_COPY_HANDLE, HOOK_COUNT };
+enum { HOOK_SETOPT, HOOK_SETOPT_ARRAY, HOOK_RESET, HOOK_COPY_HANDLE, HOOK_CLOSE, HOOK_COUNT };
 
 static curl_hardening_function_hook curl_hardening_hooks[HOOK_COUNT] = {
-	[HOOK_SETOPT]       = { "curl_setopt",       sizeof("curl_setopt") - 1,       curl_hardening_setopt,       NULL, NULL },
-	[HOOK_SETOPT_ARRAY] = { "curl_setopt_array", sizeof("curl_setopt_array") - 1, curl_hardening_setopt_array, NULL, NULL },
-	[HOOK_RESET]        = { "curl_reset",        sizeof("curl_reset") - 1,        curl_hardening_reset,        NULL, NULL },
-	[HOOK_COPY_HANDLE]  = { "curl_copy_handle",  sizeof("curl_copy_handle") - 1,  curl_hardening_copy_handle,  NULL, NULL },
+	[HOOK_SETOPT]       = { "curl_setopt",       sizeof("curl_setopt") - 1,       curl_hardening_setopt,       NULL },
+	[HOOK_SETOPT_ARRAY] = { "curl_setopt_array", sizeof("curl_setopt_array") - 1, curl_hardening_setopt_array, NULL },
+	[HOOK_RESET]        = { "curl_reset",        sizeof("curl_reset") - 1,        curl_hardening_reset,        NULL },
+	[HOOK_COPY_HANDLE]  = { "curl_copy_handle",  sizeof("curl_copy_handle") - 1,  curl_hardening_copy_handle,  NULL },
+	[HOOK_CLOSE]        = { "curl_close",        sizeof("curl_close") - 1,        curl_hardening_close,        NULL },
 };
-
-/* A callable copy of curl_setopt_array() still pointing at ext/curl, used to
- * apply the options on either side of ours in the order they were given. */
-static zend_internal_function curl_hardening_orig_setopt_array_fn;
 
 #define CURL_HARDENING_CALL_ORIGINAL(hook) \
 	curl_hardening_hooks[hook].original(INTERNAL_FUNCTION_PARAM_PASSTHRU)
 
-/* The option argument, when it is an int: the only form we have to recognise
+/* Whether the option argument designates CURLOPT_OPENSOCKETFUNCTION, recognised
  * without parsing the arguments ourselves, which would repeat any diagnostic
- * ext/curl emits for the calls we merely forward. */
-static bool curl_hardening_arg_long(zend_execute_data *execute_data, uint32_t num, zend_long *value)
+ * ext/curl emits for the calls we merely forward. Besides an int, a numeric
+ * string is accepted in coercive typing mode, as ext/curl's int parameter would
+ * accept it, so that both reach the same option. */
+static bool curl_hardening_arg_is_ours(zend_execute_data *execute_data, uint32_t num)
 {
 	if (ZEND_NUM_ARGS() < num) {
 		return false;
@@ -635,32 +531,27 @@ static bool curl_hardening_arg_long(zend_execute_data *execute_data, uint32_t nu
 
 	zval *arg = ZEND_CALL_ARG(execute_data, num);
 	ZVAL_DEREF(arg);
-	if (Z_TYPE_P(arg) != IS_LONG) {
-		return false;
+
+	if (Z_TYPE_P(arg) == IS_LONG) {
+		return Z_LVAL_P(arg) == CURLOPT_OPENSOCKETFUNCTION;
 	}
 
-	*value = Z_LVAL_P(arg);
-	return true;
+	zend_long lval;
+	return Z_TYPE_P(arg) == IS_STRING
+		&& !ZEND_ARG_USES_STRICT_TYPES()
+		&& is_numeric_string(Z_STRVAL_P(arg), Z_STRLEN_P(arg), &lval, NULL, false) == IS_LONG
+		&& lval == CURLOPT_OPENSOCKETFUNCTION;
 }
 
 static ZEND_NAMED_FUNCTION(curl_hardening_setopt)
 {
-	zend_long option;
-
-	if (!curl_hardening_arg_long(execute_data, 2, &option) || option != CURLOPT_OPENSOCKETFUNCTION) {
+	if (!curl_hardening_arg_is_ours(execute_data, 2)) {
 		CURL_HARDENING_CALL_ORIGINAL(HOOK_SETOPT);
-
-		if (Z_TYPE_P(return_value) == IS_TRUE && curl_hardening_arg_long(execute_data, 2, &option)) {
-			zval *zid = ZEND_CALL_ARG(execute_data, 1);
-			zval *value = ZEND_CALL_ARG(execute_data, 3);
-			ZVAL_DEREF(zid);
-			ZVAL_DEREF(value);
-			curl_hardening_record_option(Z_OBJ_P(zid), option, value);
-		}
 		return;
 	}
 
 	zval *zid, *zvalue;
+	zend_long option;
 
 	ZEND_PARSE_PARAMETERS_START(3, 3)
 		Z_PARAM_OBJECT_OF_CLASS(zid, curl_ce)
@@ -671,33 +562,35 @@ static ZEND_NAMED_FUNCTION(curl_hardening_setopt)
 	RETURN_BOOL(curl_hardening_set_callback(Z_OBJ_P(zid), zvalue, /* is_array_config */ false));
 }
 
-/* Applies a run of options that are not ours through ext/curl. The segment is
- * a counted reference: an exception thrown by ext/curl captures it in its
- * trace, so the caller must release it, never clear or destroy it in place. */
-static bool curl_hardening_apply_segment(zval *zid, zval *segment)
+/* Applies a run of options that are not ours through ext/curl, by calling its
+ * handler on the current frame with the array argument swapped for the run.
+ * Going through zend_call_function() instead would differ from a native call:
+ * it adds a frame to traces, discards the result when an exception is pending,
+ * and does not call anything at all if one already is -- an error handler
+ * turning a notice into an exception would then stop the remaining options,
+ * where ext/curl applies them. Like ext/curl, stop only on a false result.
+ *
+ * The run is a counted reference: an exception thrown by ext/curl captures it
+ * in its trace, so the caller must release it, never clear it in place. */
+static bool curl_hardening_apply_segment(zend_execute_data *execute_data, zval *segment)
 {
 	if (zend_hash_num_elements(Z_ARRVAL_P(segment)) == 0) {
 		return true;
 	}
 
-	zval params[2], retval;
-	ZVAL_COPY_VALUE(&params[0], zid);
-	ZVAL_COPY_VALUE(&params[1], segment);
-	ZVAL_UNDEF(&retval);
+	zval *arg = ZEND_CALL_ARG(execute_data, 2);
+	zval saved, retval;
 
-	zend_call_known_function((zend_function *) &curl_hardening_orig_setopt_array_fn,
-		NULL, NULL, &retval, 2, params, NULL);
+	ZVAL_COPY_VALUE(&saved, arg);
+	ZVAL_COPY_VALUE(arg, segment);
+	ZVAL_NULL(&retval);
+
+	curl_hardening_hooks[HOOK_SETOPT_ARRAY].original(execute_data, &retval);
+
+	ZVAL_COPY_VALUE(arg, &saved);
 
 	bool ok = Z_TYPE(retval) == IS_TRUE;
 	zval_ptr_dtor(&retval);
-
-	if (ok) {
-		zend_ulong option;
-		zval *value;
-		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(segment), option, value) {
-			curl_hardening_record_option(Z_OBJ_P(zid), (zend_long) option, value);
-		} ZEND_HASH_FOREACH_END();
-	}
 
 	return ok;
 }
@@ -714,16 +607,6 @@ static ZEND_NAMED_FUNCTION(curl_hardening_setopt_array)
 	if (arr == NULL || Z_TYPE_P(arr) != IS_ARRAY
 			|| !zend_hash_index_exists(Z_ARRVAL_P(arr), CURLOPT_OPENSOCKETFUNCTION)) {
 		CURL_HARDENING_CALL_ORIGINAL(HOOK_SETOPT_ARRAY);
-
-		if (Z_TYPE_P(return_value) == IS_TRUE && arr != NULL && Z_TYPE_P(arr) == IS_ARRAY) {
-			zval *zid = ZEND_CALL_ARG(execute_data, 1);
-			zend_ulong option;
-			zval *value;
-			ZVAL_DEREF(zid);
-			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(arr), option, value) {
-				curl_hardening_record_option(Z_OBJ_P(zid), (zend_long) option, value);
-			} ZEND_HASH_FOREACH_END();
-		}
 		return;
 	}
 
@@ -747,7 +630,7 @@ static ZEND_NAMED_FUNCTION(curl_hardening_setopt_array)
 
 	ZEND_HASH_FOREACH_KEY_VAL(options, option, key, value) {
 		if (key == NULL && option == CURLOPT_OPENSOCKETFUNCTION) {
-			ok = curl_hardening_apply_segment(zid, &segment)
+			ok = curl_hardening_apply_segment(execute_data, &segment)
 				&& curl_hardening_set_callback(Z_OBJ_P(zid), value, /* is_array_config */ true);
 			zval_ptr_dtor(&segment);
 			array_init(&segment);
@@ -766,7 +649,7 @@ static ZEND_NAMED_FUNCTION(curl_hardening_setopt_array)
 	} ZEND_HASH_FOREACH_END();
 
 	if (ok) {
-		ok = curl_hardening_apply_segment(zid, &segment);
+		ok = curl_hardening_apply_segment(execute_data, &segment);
 	}
 
 	zval_ptr_dtor(&segment);
@@ -794,10 +677,26 @@ static ZEND_NAMED_FUNCTION(curl_hardening_reset)
 		/* curl_easy_reset() cleared libcurl's side: release ours. */
 		curl_hardening_state *state = hh->state;
 		hh->state = NULL;
-		hh->interface_set = false;
-		hh->localport_set = false;
 		curl_hardening_state_release(state);
 	}
+}
+
+static ZEND_NAMED_FUNCTION(curl_hardening_close)
+{
+	zval *handle = ZEND_NUM_ARGS() >= 1 ? ZEND_CALL_ARG(execute_data, 1) : NULL;
+
+	if (handle != NULL) {
+		ZVAL_DEREF(handle);
+		if (Z_TYPE_P(handle) == IS_OBJECT && Z_OBJCE_P(handle) == curl_ce) {
+			curl_hardening_handle *hh = curl_hardening_handle_find(Z_OBJ_P(handle));
+			if (hh != NULL && hh->in_callback) {
+				zend_throw_error(NULL, "%s(): Attempt to close cURL handle from a callback", get_active_function_name());
+				RETURN_THROWS();
+			}
+		}
+	}
+
+	CURL_HARDENING_CALL_ORIGINAL(HOOK_CLOSE);
 }
 
 /* dst is a copy of src: it gets src's options, ours included, and its own
@@ -813,11 +712,8 @@ static void curl_hardening_bind_copy(zend_object *src, zend_object *dst)
 		return;
 	}
 
-	curl_hardening_handle *to = curl_hardening_handle_get(dst);
-	to->interface_set = from->interface_set;
-	to->localport_set = from->localport_set;
-
 	if (from->state != NULL) {
+		curl_hardening_handle *to = curl_hardening_handle_get(dst);
 		to->state = from->state;
 		curl_hardening_state_acquire(to->state);
 		curl_hardening_arm(to);
@@ -851,22 +747,18 @@ static zend_object *curl_hardening_clone_obj(zend_object *object)
 
 static void curl_hardening_free_obj(zend_object *object)
 {
-	curl_hardening_handle *hh = NULL;
+	curl_hardening_handle *hh = curl_hardening_handle_find(object);
 
-	if (CURL_HARDENING_G(active)) {
-		hh = curl_hardening_handle_find(object);
-		if (hh != NULL) {
-			zend_hash_index_del(&CURL_HARDENING_G(handles), CURL_HARDENING_KEY(object));
-		}
+	if (hh != NULL) {
+		/* From here on, the trampoline refuses whatever still carries the id. */
+		zend_hash_index_del(&CURL_HARDENING_G(handles), CURL_HARDENING_KEY(object));
+		zend_hash_index_del(&CURL_HARDENING_G(ids), hh->id);
 	}
 
-	/* Runs curl_easy_cleanup(): once it returns libcurl no longer reaches hh,
-	 * and hh and its state can go. */
 	curl_hardening_orig_free_obj(object);
 
 	if (hh != NULL) {
-		curl_hardening_state_release(hh->state);
-		efree(hh);
+		curl_hardening_handle_free(hh);
 	}
 }
 
@@ -903,23 +795,19 @@ static zend_result curl_hardening_hook_curl(void)
 		return FAILURE;
 	}
 
+	zend_function *functions[HOOK_COUNT];
+
 	for (int i = 0; i < HOOK_COUNT; i++) {
-		zend_function *fn = zend_hash_str_find_ptr(CG(function_table),
+		functions[i] = zend_hash_str_find_ptr(CG(function_table),
 			curl_hardening_hooks[i].name, curl_hardening_hooks[i].name_len);
-		if (fn == NULL || fn->type != ZEND_INTERNAL_FUNCTION) {
+		if (functions[i] == NULL || functions[i]->type != ZEND_INTERNAL_FUNCTION) {
 			return FAILURE;
 		}
-		curl_hardening_hooks[i].function = fn;
 	}
 
-	memcpy(&curl_hardening_orig_setopt_array_fn,
-		&curl_hardening_hooks[HOOK_SETOPT_ARRAY].function->internal_function,
-		sizeof(zend_internal_function));
-
 	for (int i = 0; i < HOOK_COUNT; i++) {
-		zend_internal_function *fn = &curl_hardening_hooks[i].function->internal_function;
-		curl_hardening_hooks[i].original = fn->handler;
-		fn->handler = curl_hardening_hooks[i].hook;
+		curl_hardening_hooks[i].original = functions[i]->internal_function.handler;
+		functions[i]->internal_function.handler = curl_hardening_hooks[i].hook;
 	}
 
 	curl_hardening_curl_handlers = handlers;
@@ -935,10 +823,14 @@ static zend_result curl_hardening_hook_curl(void)
 
 static void curl_hardening_unhook_curl(void)
 {
+	/* Looked up again rather than kept from MINIT: disable_functions removes
+	 * functions from the table, and frees them, after every MINIT ran. */
 	for (int i = 0; i < HOOK_COUNT; i++) {
-		if (curl_hardening_hooks[i].function != NULL) {
-			curl_hardening_hooks[i].function->internal_function.handler = curl_hardening_hooks[i].original;
-			curl_hardening_hooks[i].function = NULL;
+		zend_function *fn = zend_hash_str_find_ptr(CG(function_table),
+			curl_hardening_hooks[i].name, curl_hardening_hooks[i].name_len);
+		if (fn != NULL && fn->type == ZEND_INTERNAL_FUNCTION
+				&& fn->internal_function.handler == curl_hardening_hooks[i].hook) {
+			fn->internal_function.handler = curl_hardening_hooks[i].original;
 		}
 	}
 
@@ -959,6 +851,7 @@ static PHP_GINIT_FUNCTION(curl_hardening)
 #endif
 	curl_hardening_globals->probe_state = 0;
 	curl_hardening_globals->active = false;
+	curl_hardening_globals->last_id = 0;
 }
 
 static PHP_RINIT_FUNCTION(curl_hardening)
@@ -971,40 +864,39 @@ static PHP_RINIT_FUNCTION(curl_hardening)
 	}
 
 	CURL_HARDENING_G(probe_state) = 0;
-	/* Request scoped: its buckets come from the request heap. */
+	/* Request scoped: their buckets come from the request heap. */
 	zend_hash_init(&CURL_HARDENING_G(handles), 8, NULL, NULL, 0);
+	zend_hash_init(&CURL_HARDENING_G(ids), 8, NULL, NULL, 0);
 	CURL_HARDENING_G(active) = true;
 
 	return SUCCESS;
 }
 
-static PHP_RSHUTDOWN_FUNCTION(curl_hardening)
+/* No RSHUTDOWN: user code still runs after it, from the RSHUTDOWN of extensions
+ * that come later (session handlers writing the session, for instance), and
+ * must find its callbacks in place. The tables are torn down once the executor
+ * freed every object, each CurlHandle releasing its own binding on the way. */
+static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(curl_hardening)
 {
-	if (!curl_hardening_enabled) {
+	if (!CURL_HARDENING_G(active)) {
 		return SUCCESS;
 	}
 
-	HashTable *handles = &CURL_HARDENING_G(handles);
-	curl_hardening_handle *hh;
-
-	/* Handles still referenced now are freed later by the executor, after us.
-	 * Disarm them all first, while every one of them is still alive. */
-	ZEND_HASH_FOREACH_PTR(handles, hh) {
-		if (hh->state != NULL) {
-			curl_hardening_disarm(hh->object);
-		}
-	} ZEND_HASH_FOREACH_END();
-
-	/* Releasing a callback may free the last reference to a CurlHandle: from
-	 * here on, free_obj must leave the table alone. */
 	CURL_HARDENING_G(active) = false;
 
-	ZEND_HASH_FOREACH_PTR(handles, hh) {
-		curl_hardening_state_release(hh->state);
+	/* Whatever is left belongs to objects that were never freed, after a fatal
+	 * error for instance. Those objects, and the callbacks' objects, may be gone
+	 * already: free our own memory without touching them. */
+	curl_hardening_handle *hh;
+	ZEND_HASH_FOREACH_PTR(&CURL_HARDENING_G(handles), hh) {
+		if (hh->state != NULL && --hh->state->refcount == 0) {
+			efree(hh->state);
+		}
 		efree(hh);
 	} ZEND_HASH_FOREACH_END();
 
-	zend_hash_destroy(handles);
+	zend_hash_destroy(&CURL_HARDENING_G(ids));
+	zend_hash_destroy(&CURL_HARDENING_G(handles));
 
 	return SUCCESS;
 }
@@ -1043,21 +935,14 @@ static PHP_MINIT_FUNCTION(curl_hardening)
 		return FAILURE;
 	}
 
-	register_curl_hardening_symbols(module_number);
-	curl_address_family_ce = register_class_CurlAddressFamily();
-	curl_socket_address_ce = register_class_CurlSocketAddress();
-	curl_socket_ce = register_class_CurlSocket();
-
-	curl_socket_ce->create_object = curl_socket_create_object;
-	memcpy(&curl_socket_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-	curl_socket_object_handlers.offset = offsetof(curl_socket_object, std);
-	curl_socket_object_handlers.clone_obj = curl_socket_clone_object;
-	curl_socket_ce->default_object_handlers = &curl_socket_object_handlers;
-
+	/* Hooks first: on failure, nothing is registered. */
 	if (curl_hardening_hook_curl() == FAILURE) {
 		zend_error(E_CORE_WARNING, "curl_hardening: could not hook ext/curl");
 		return FAILURE;
 	}
+
+	register_curl_hardening_symbols(module_number);
+	curl_address_family_ce = register_class_CurlAddressFamily();
 
 	curl_hardening_enabled = true;
 	return SUCCESS;
@@ -1084,13 +969,13 @@ zend_module_entry curl_hardening_module_entry = {
 	PHP_MINIT(curl_hardening),
 	PHP_MSHUTDOWN(curl_hardening),
 	PHP_RINIT(curl_hardening),
-	PHP_RSHUTDOWN(curl_hardening),
+	NULL,
 	PHP_MINFO(curl_hardening),
 	PHP_CURL_HARDENING_VERSION,
 	PHP_MODULE_GLOBALS(curl_hardening),
 	PHP_GINIT(curl_hardening),
 	NULL,
-	NULL,
+	ZEND_MODULE_POST_ZEND_DEACTIVATE_N(curl_hardening),
 	STANDARD_MODULE_PROPERTIES_EX
 };
 

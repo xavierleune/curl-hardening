@@ -11,8 +11,8 @@ curl_hardening
 gc_collect_cycles();
 
 $ch = curl_init('http://127.0.0.1:1/');
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function () use ($ch): ?CurlSocket {
-    return new CurlSocket();
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function () use ($ch): bool {
+    return true;
 });
 $handle = WeakReference::create($ch);
 unset($ch);
@@ -29,8 +29,8 @@ $port = (int) explode(':', stream_socket_get_name($server, false))[1];
 $ch = curl_init("http://127.0.0.1:{$port}/");
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 curl_setopt($ch, CURLOPT_TIMEOUT_MS, 500);
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function () use ($ch): ?CurlSocket {
-    return null;
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function () use ($ch): bool {
+    return false;
 });
 $copy = curl_copy_handle($ch);
 unset($ch);

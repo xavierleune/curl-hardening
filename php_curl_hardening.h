@@ -20,8 +20,13 @@ extern zend_module_entry curl_hardening_module_entry;
 ZEND_BEGIN_MODULE_GLOBALS(curl_hardening)
 	/* CurlHandle object address => its curl_hardening_handle. Request scoped. */
 	HashTable handles;
-	/* True between RINIT and the point in RSHUTDOWN where bindings are torn
-	 * down; ext/curl hooks must not touch the table outside of it. */
+	/* Binding id => its curl_hardening_handle, not owning. libcurl is given the
+	 * id rather than a pointer: see curl_hardening_arm(). */
+	HashTable ids;
+	/* Last binding id handed out. Never reset, so an id is never reused. */
+	zend_ulong last_id;
+	/* True from RINIT until post-deactivation, after the executor freed every
+	 * object: the tables only exist in between. */
 	bool active;
 	/* 0 = not probed yet, 1 = probe succeeded, -1 = probe failed. */
 	int probe_state;

@@ -26,7 +26,7 @@ function measure(string $label, callable $iteration, bool $collectEach = false):
     printf("%-44s %s\n", $label, $growth < LIMIT ? 'flat' : "GREW by {$growth} bytes");
 }
 
-$guard = fn (CurlHandle $h, int $p, CurlSocketAddress $a): ?CurlSocket => null;
+$guard = fn (CurlHandle $h, CurlAddressFamily $f, string $a, ?int $p): bool => false;
 
 measure('a new handle per job', function () use ($guard) {
     $ch = curl_init('http://127.0.0.1:1/');
@@ -54,8 +54,8 @@ measure('copies and clones of a filtered handle', function () use ($guard) {
  * never shrunk, rather than anything the extension keeps. */
 measure('a callback capturing its own handle', function () {
     $ch = curl_init('http://127.0.0.1:1/');
-    curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function () use ($ch): ?CurlSocket {
-        return curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) !== '' ? null : new CurlSocket();
+    curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function () use ($ch): bool {
+        return curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) === '';
     });
 }, collectEach: true);
 

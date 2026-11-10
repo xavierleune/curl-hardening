@@ -12,9 +12,9 @@ $port = (int) explode(':', stream_socket_get_name($server, false))[1];
 
 $calls = [];
 $refuse = function (string $name) use (&$calls): Closure {
-    return function (CurlHandle $handle) use ($name, &$calls): ?CurlSocket {
+    return function (CurlHandle $handle) use ($name, &$calls): bool {
         $calls[] = [$name, $handle];
-        return null;
+        return false;
     };
 };
 

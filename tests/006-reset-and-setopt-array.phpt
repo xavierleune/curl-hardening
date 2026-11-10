@@ -8,7 +8,7 @@ curl_hardening
 $server = stream_socket_server('tcp://127.0.0.1:0');
 $port = (int) explode(':', stream_socket_get_name($server, false))[1];
 $url = "http://127.0.0.1:{$port}/";
-$refuse = fn (): ?CurlSocket => null;
+$refuse = fn (): bool => false;
 
 echo "curl_reset() removes the callback, like any other option\n";
 $ch = curl_init($url);
@@ -21,9 +21,9 @@ var_dump(curl_errno($ch) === CURLE_OPERATION_TIMEDOUT);
 echo "\n... but not from within it, as ext/curl refuses for its own callbacks\n";
 $ch = curl_init($url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function (CurlHandle $handle): ?CurlSocket {
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function (CurlHandle $handle): bool {
     curl_reset($handle);
-    return new CurlSocket();
+    return true;
 });
 try {
     curl_exec($ch);

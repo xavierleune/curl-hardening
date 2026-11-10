@@ -5,7 +5,7 @@ curl
 curl_hardening
 --FILE--
 <?php
-var_dump(CURLOPT_OPENSOCKETFUNCTION, CURLSOCKTYPE_IPCXN);
+var_dump(CURLOPT_OPENSOCKETFUNCTION);
 
 /* A listening socket that never answers: an allowed attempt connects and then
  * times out, a refused one never reaches connect(). A literal address means a
@@ -23,21 +23,20 @@ function handle(int $port): CurlHandle {
 echo "\nWhat the callback receives\n";
 $ch = handle($port);
 var_dump(curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION,
-    function (CurlHandle $handle, int $purpose, CurlSocketAddress $address) use (&$ch, $port): ?CurlSocket {
-        var_dump($handle === $ch, $purpose === CURLSOCKTYPE_IPCXN);
-        var_dump($address->family, $address->address, $address->port === $port);
-        return new CurlSocket();
+    function (CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $p) use (&$ch, $port): bool {
+        var_dump($handle === $ch, $family, $address, $p === $port);
+        return true;
     }));
 curl_exec($ch);
 var_dump(curl_errno($ch) === CURLE_OPERATION_TIMEDOUT);
 
-echo "\nReturning null refuses the connection\n";
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, fn (): ?CurlSocket => null);
+echo "\nReturning false refuses the connection\n";
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, fn (): bool => false);
 curl_exec($ch);
 var_dump(curl_errno($ch) === CURLE_COULDNT_CONNECT);
 
 echo "\nAny other return value refuses it and raises a TypeError\n";
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, fn () => true);
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, fn () => null);
 try {
     curl_exec($ch);
 } catch (TypeError $e) {
@@ -45,7 +44,7 @@ try {
 }
 
 echo "\nAn exception refuses it and propagates\n";
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function (): ?CurlSocket {
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, function (): bool {
     throw new RuntimeException('blocked');
 });
 try {
@@ -56,7 +55,7 @@ try {
 var_dump(curl_errno($ch) === CURLE_COULDNT_CONNECT);
 
 echo "\nnull removes the callback\n";
-curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, fn (): ?CurlSocket => null);
+curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, fn (): bool => false);
 var_dump(curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, null));
 curl_exec($ch);
 var_dump(curl_errno($ch) === CURLE_OPERATION_TIMEDOUT);
@@ -79,9 +78,9 @@ final class Policy {
     public function install(CurlHandle $ch): void {
         curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, [$this, 'decide']);
     }
-    private function decide(CurlHandle $handle, int $purpose, CurlSocketAddress $address): ?CurlSocket {
+    private function decide(CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $port): bool {
         echo "private method called\n";
-        return null;
+        return false;
     }
 }
 $ch = handle($port);
@@ -93,10 +92,8 @@ echo "Done\n";
 ?>
 --EXPECT--
 int(20163)
-int(0)
 
 What the callback receives
-bool(true)
 bool(true)
 bool(true)
 enum(CurlAddressFamily::IpV4)
@@ -104,11 +101,11 @@ string(9) "127.0.0.1"
 bool(true)
 bool(true)
 
-Returning null refuses the connection
+Returning false refuses the connection
 bool(true)
 
 Any other return value refuses it and raises a TypeError
-The CURLOPT_OPENSOCKETFUNCTION callback must return a CurlSocket or null
+The CURLOPT_OPENSOCKETFUNCTION callback must return a bool
 
 An exception refuses it and propagates
 blocked
