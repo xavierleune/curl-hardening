@@ -20,8 +20,9 @@ curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION,
 For a deny list maintained for outgoing requests, use the one of Symfony's
 [`NoPrivateNetworkHttpClient`](https://github.com/symfony/symfony/blob/8.2/src/Symfony/Component/HttpClient/NoPrivateNetworkHttpClient.php),
 [`IpUtils::PRIVATE_SUBNETS`](https://github.com/symfony/symfony/blob/8.2/src/Symfony/Component/HttpFoundation/IpUtils.php#L19),
-which also covers the IPv6 prefixes that embed an IPv4 address (NAT64, 6to4,
-Teredo):
+which also refuses the NAT64 prefixes (`64:ff9b::/96` and `64:ff9b:1::/48`):
+`FILTER_FLAG_GLOBAL_RANGE` accepts them, while an address such as
+`64:ff9b::a9fe:a9fe` reaches 169.254.169.254 through a NAT64 gateway:
 
 ```php
 use Symfony\Component\HttpFoundation\IpUtils;
