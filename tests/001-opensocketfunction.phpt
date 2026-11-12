@@ -23,8 +23,8 @@ function handle(int $port): CurlHandle {
 echo "\nWhat the callback receives\n";
 $ch = handle($port);
 var_dump(curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION,
-    function (CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $p) use (&$ch, $port): bool {
-        var_dump($handle === $ch, $family, $address, $p === $port);
+    function (CurlHandle $handle, string $address, int $p) use (&$ch, $port): bool {
+        var_dump($handle === $ch, $address, $p === $port);
         return true;
     }));
 curl_exec($ch);
@@ -78,7 +78,7 @@ final class Policy {
     public function install(CurlHandle $ch): void {
         curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION, [$this, 'decide']);
     }
-    private function decide(CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $port): bool {
+    private function decide(CurlHandle $handle, string $address, int $port): bool {
         echo "private method called\n";
         return false;
     }
@@ -96,7 +96,6 @@ int(20163)
 What the callback receives
 bool(true)
 bool(true)
-enum(CurlAddressFamily::IpV4)
 string(9) "127.0.0.1"
 bool(true)
 bool(true)

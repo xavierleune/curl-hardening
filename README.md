@@ -9,10 +9,9 @@ resolution and before `connect()`. Its main use is SSRF filtering.
 
 ```php
 curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION,
-    function (CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $port): bool {
+    function (CurlHandle $handle, string $address, int $port): bool {
         // Only publicly routable addresses.
-        return $family !== CurlAddressFamily::Unix
-            && filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_GLOBAL_RANGE) !== false;
+        return filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_GLOBAL_RANGE) !== false;
     });
 ```
 
@@ -27,13 +26,13 @@ which also refuses the NAT64 prefixes (`64:ff9b::/96` and `64:ff9b:1::/48`):
 ```php
 use Symfony\Component\HttpFoundation\IpUtils;
 
-return $family !== CurlAddressFamily::Unix
+return filter_var($address, FILTER_VALIDATE_IP) !== false
     && !IpUtils::checkIp($address, IpUtils::PRIVATE_SUBNETS);
 ```
 
-- **`$family`**: `CurlAddressFamily::IpV4`, `IpV6` or `Unix`.
-- **`$address`**: a literal IP address, or the socket path for `Unix`.
-- **`$port`**: `null` for `Unix`.
+- **`$address`**: a literal IP address, or the path of a UNIX socket.
+  `filter_var()` with `FILTER_VALIDATE_IP` tells them apart, and rejects a path.
+- **`$port`**: 0 for a UNIX socket, as `CURLINFO_PRIMARY_PORT` reports.
 - **Return `true`** to allow the connection, **`false`** to refuse it
   (`CURLE_COULDNT_CONNECT`). Any other value raises a `TypeError`, and an
   exception propagates out of `curl_exec()`; both refuse the connection.

@@ -11,7 +11,7 @@
  * Polyfill of CURLOPT_OPENSOCKETFUNCTION as proposed for ext/curl in PHP 8.7:
  *
  *     curl_setopt($ch, CURLOPT_OPENSOCKETFUNCTION,
- *         function (CurlHandle $handle, CurlAddressFamily $family, string $address, ?int $port): bool { ... });
+ *         function (CurlHandle $handle, string $address, int $port): bool { ... });
  *
  * ext/curl does not know about the option, so the extension intercepts the
  * ext/curl functions and handlers that need to (see "Interception of ext/curl")
@@ -25,7 +25,6 @@
 
 #include "php.h"
 #include "Zend/zend_exceptions.h"
-#include "Zend/zend_enum.h"
 #include "ext/standard/info.h"
 #include "ext/standard/php_net.h"
 #include "ext/curl/php_curl.h"
@@ -57,8 +56,6 @@ ZEND_DECLARE_MODULE_GLOBALS(curl_hardening)
 
 /* True once MINIT registered the polyfill; false when ext/curl is native. */
 static bool curl_hardening_enabled;
-
-static zend_class_entry *curl_address_family_ce;
 
 /* {{{ Reaching libcurl through ext/curl
  *
@@ -280,44 +277,39 @@ static void curl_hardening_disarm(zend_object *obj)
  * socket name starts with a NUL byte, which is kept: it is part of the name. */
 static zend_string *curl_hardening_unix_path(const struct curl_sockaddr *address)
 {
-	const struct sockaddr_un *sun = (const struct sockaddr_un *) &address->addr;
+	const struct sockaddr_un *sa_un = (const struct sockaddr_un *) &address->addr;
 	size_t offset = offsetof(struct sockaddr_un, sun_path);
 	size_t len = address->addrlen > offset ? address->addrlen - offset : 0;
 
-	if (len > sizeof(sun->sun_path)) {
-		len = sizeof(sun->sun_path);
+	if (len > sizeof(sa_un->sun_path)) {
+		len = sizeof(sa_un->sun_path);
 	}
-	if (len > 0 && sun->sun_path[0] != '\0') {
+	if (len > 0 && sa_un->sun_path[0] != '\0') {
 		/* A pathname: libcurl may count the terminating NUL in addrlen. */
-		len = zend_strnlen(sun->sun_path, len);
+		len = zend_strnlen(sa_un->sun_path, len);
 	}
 
-	return zend_string_init(sun->sun_path, len, 0);
+	return zend_string_init(sa_un->sun_path, len, 0);
 }
 #endif
 
-/* Fills the $family, $address and $port arguments. Returns false for anything
+/* Fills the $address and $port arguments. Returns false for anything
  * that cannot be described, which is then refused without calling the callback. */
 static bool curl_hardening_describe(zval *args, const struct curl_sockaddr *address)
 {
-	const char *family;
-
 	switch (address->family) {
 		case AF_INET:
-			family = "IpV4";
-			ZVAL_LONG(&args[2], ntohs(((const struct sockaddr_in *) &address->addr)->sin_port));
+			ZVAL_LONG(&args[1], ntohs(((const struct sockaddr_in *) &address->addr)->sin_port));
 			break;
 #ifdef AF_INET6
 		case AF_INET6:
-			family = "IpV6";
-			ZVAL_LONG(&args[2], ntohs(((const struct sockaddr_in6 *) &address->addr)->sin6_port));
+			ZVAL_LONG(&args[1], ntohs(((const struct sockaddr_in6 *) &address->addr)->sin6_port));
 			break;
 #endif
 #if defined(AF_UNIX) && !defined(PHP_WIN32)
 		case AF_UNIX:
-			/* A path has no port. */
-			family = "Unix";
-			ZVAL_NULL(&args[2]);
+			/* A path has no port: 0, as CURLINFO_PRIMARY_PORT reports. */
+			ZVAL_LONG(&args[1], 0);
 			break;
 #endif
 		default:
@@ -326,7 +318,7 @@ static bool curl_hardening_describe(zval *args, const struct curl_sockaddr *addr
 
 #if defined(AF_UNIX) && !defined(PHP_WIN32)
 	if (address->family == AF_UNIX) {
-		ZVAL_STR(&args[1], curl_hardening_unix_path(address));
+		ZVAL_STR(&args[0], curl_hardening_unix_path(address));
 	} else
 #endif
 	{
@@ -334,10 +326,9 @@ static bool curl_hardening_describe(zval *args, const struct curl_sockaddr *addr
 		if (ip == NULL) {
 			return false;
 		}
-		ZVAL_STR(&args[1], ip);
+		ZVAL_STR(&args[0], ip);
 	}
 
-	ZVAL_OBJ_COPY(&args[0], zend_enum_get_case_cstr(curl_address_family_ce, family));
 	return true;
 }
 /* }}} */
@@ -358,7 +349,7 @@ static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpo
 		return CURL_SOCKET_BAD;
 	}
 
-	zval args[4], retval;
+	zval args[3], retval;
 
 	if (!curl_hardening_describe(&args[1], address)) {
 		return CURL_SOCKET_BAD;
@@ -374,7 +365,7 @@ static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpo
 
 	bool was_in_callback = hh->in_callback;
 	hh->in_callback = true;
-	zend_call_known_fcc(&state->fcc, &retval, /* param_count */ 4, args, /* named_params */ NULL);
+	zend_call_known_fcc(&state->fcc, &retval, /* param_count */ 3, args, /* named_params */ NULL);
 	hh->in_callback = was_in_callback;
 
 	curl_socket_t fd = CURL_SOCKET_BAD;
@@ -401,7 +392,6 @@ static curl_socket_t curl_hardening_opensocket(void *clientp, curlsocktype purpo
 
 	zval_ptr_dtor(&args[0]);
 	zval_ptr_dtor(&args[1]);
-	zval_ptr_dtor(&args[2]);
 	curl_hardening_state_release(state);
 
 	return fd;
@@ -942,7 +932,6 @@ static PHP_MINIT_FUNCTION(curl_hardening)
 	}
 
 	register_curl_hardening_symbols(module_number);
-	curl_address_family_ce = register_class_CurlAddressFamily();
 
 	curl_hardening_enabled = true;
 	return SUCCESS;

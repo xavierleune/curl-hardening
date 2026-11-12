@@ -26,7 +26,7 @@ function measure(string $label, callable $iteration, bool $collectEach = false):
     printf("%-44s %s\n", $label, $growth < LIMIT ? 'flat' : "GREW by {$growth} bytes");
 }
 
-$guard = fn (CurlHandle $h, CurlAddressFamily $f, string $a, ?int $p): bool => false;
+$guard = fn (CurlHandle $h, string $a, int $p): bool => false;
 
 measure('a new handle per job', function () use ($guard) {
     $ch = curl_init('http://127.0.0.1:1/');

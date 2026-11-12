@@ -12,14 +12,3 @@
  * @cvalue CURLOPT_OPENSOCKETFUNCTION
  */
 const CURLOPT_OPENSOCKETFUNCTION = UNKNOWN;
-
-/**
- * The address family of the endpoint libcurl is about to connect to, as reported
- * to the CURLOPT_OPENSOCKETFUNCTION callback.
- */
-enum CurlAddressFamily
-{
-    case IpV4;
-    case IpV6;
-    case Unix;
-}
